@@ -1,0 +1,14 @@
+# Used by: every model file, all training loops
+torch>=2.0.0
+
+# torchvision — image transforms, dataset utilities
+# Used by: data/augmentations.py, models/byol.py (SwinV2 fallback backbone)
+torchvision>=0.15.0
+
+# Ultralytics — provides YOLOv12 pretrained weights and training/inference API
+# Used by: models/yolov12_proposal.py, stages/finetune_yolov12.py
+ultralytics>=8.0.0
+
+# Pillow — reading image dimensions in prepare_opixray.py
+# Used by: data/prepare_opixray.py
+Pillow>=9.0.0
