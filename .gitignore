@@ -1,31 +1,16 @@
-# Model weights — too large for GitHub
-*.pt
-*.pth
-*.ckpt
-*.weights
-
-# Dataset files — store separately
 *.jpg
 *.jpeg
 *.png
-*.json
-
-# Output folders — generated during training
+*.bmp
+*.pt
+*.pth
+*.ckpt
 outputs/
 opixray_yolo/
 runs/
-
-# Python cache
 __pycache__/
 *.pyc
-*.pyo
 .venv/
 venv/
-*.egg-info/
-
-# VS Code
-.vscode/
-
-# OS files
 .DS_Store
 Thumbs.db
