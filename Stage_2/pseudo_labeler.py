@@ -21,8 +21,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from models.byol import BYOL
-from models.yolov12_proposal import YOLOv12ProposalGenerator
+from Stage_1.byol import BYOL
+from Stage_2.yolov12 import YOLOv12ProposalGenerator
 
 
 # ── Classification head h_φ ───────────────────────────────────────────────────

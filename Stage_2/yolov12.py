@@ -22,7 +22,7 @@ class YOLOv12ProposalGenerator:
 
     Combines two responsibilities:
       1. Fine-tuning  — adapts COCO-pretrained weights to X-ray imagery
-                        using a two-phase frozen/unfrozen strategy.
+                        using a single full fine-tuning stage (no freezing).
       2. Inference    — runs the (optionally fine-tuned) model on X-ray
                         scans and returns filtered bounding box proposals.
 
@@ -41,32 +41,29 @@ class YOLOv12ProposalGenerator:
         output_dir     : where fine-tuning checkpoints are saved
     """
 
-    # Default fine-tuning hyperparameters — mirror finetune_config.py
-    # but kept here so the class works standalone without importing configs.
+    # Default fine-tuning hyperparameters
     _DEFAULT_FT = {
-        "epochs":        100,
-        "freeze_epochs": 10,
-        "freeze_layers": 10,
-        "batch_size":    16,
-        "num_workers":   4,
-        "optimizer":     "AdamW",
-        "lr0":           1e-4,
-        "lrf":           0.01,
-        "momentum":      0.937,
-        "weight_decay":  5e-4,
+        "epochs":       100,
+        "batch_size":   16,
+        "num_workers":  4,
+        "optimizer":    "AdamW",
+        "lr0":          1e-4,
+        "lrf":          0.01,
+        "momentum":     0.937,
+        "weight_decay": 5e-4,
         "warmup_epochs": 3,
-        "mosaic":        1.0,
-        "mixup":         0.0,
-        "copy_paste":    0.1,
-        "hsv_h":         0.0,   # no hue shift — X-rays are pseudo-colour
-        "hsv_s":         0.2,
-        "hsv_v":         0.4,
-        "fliplr":        0.5,
-        "flipud":        0.0,
-        "scale":         0.5,
-        "translate":     0.1,
-        "save_period":   10,
-        "patience":      20,
+        "mosaic":       1.0,
+        "mixup":        0.0,
+        "copy_paste":   0.1,
+        "hsv_h":        0.0,   # no hue shift — X-rays are pseudo-colour
+        "hsv_s":        0.2,
+        "hsv_v":        0.4,
+        "fliplr":       0.5,
+        "flipud":       0.0,
+        "scale":        0.5,
+        "translate":    0.1,
+        "save_period":  10,
+        "patience":     20,
     }
 
     def __init__(
@@ -94,8 +91,8 @@ class YOLOv12ProposalGenerator:
         )
 
         # Track which weights are currently loaded
-        self._weights_path  = weights_path
-        self._finetuned     = False
+        self._weights_path = weights_path
+        self._finetuned    = False
 
         # Load the starting model
         self.model = _YOLO(weights_path)
@@ -108,91 +105,40 @@ class YOLOv12ProposalGenerator:
         self,
         data_yaml: str,
         epochs: Optional[int] = None,
-        freeze_epochs: Optional[int] = None,
         **kwargs,
     ) -> str:
         """
-        Fine-tune the model on an X-ray dataset in two phases.
+        Fine-tune the model on an X-ray dataset in a single stage.
 
-        Phase 1 — frozen backbone:
-            Only the detection head trains. Lets the head adapt to
-            X-ray threat categories before the backbone starts moving.
-
-        Phase 2 — full fine-tuning:
-            All layers unfreeze. The backbone adapts to X-ray domain
-            features at a low learning rate.
+        All layers train from the start — no backbone freezing.
+        The low learning rate (1e-4) protects the COCO features from
+        being overwritten too aggressively.
 
         After fine-tuning completes, the class automatically switches to
         the best fine-tuned weights for all subsequent propose() calls.
 
         Args:
-            data_yaml     : path to the dataset YAML (e.g. opixray.yaml)
-            epochs        : total epochs (overrides default 100)
-            freeze_epochs : frozen-backbone epochs (overrides default 10)
-            **kwargs      : override any other fine-tuning hyperparameter
+            data_yaml : path to the dataset YAML (e.g. opixray.yaml)
+            epochs    : total epochs (overrides default 100)
+            **kwargs  : override any other fine-tuning hyperparameter
 
         Returns:
             Path to best.pt fine-tuned weights file
         """
         cfg = dict(self._DEFAULT_FT)
         cfg["img_size"] = self.img_size
-        if epochs        is not None: cfg["epochs"]        = epochs
-        if freeze_epochs is not None: cfg["freeze_epochs"] = freeze_epochs
+        if epochs is not None:
+            cfg["epochs"] = epochs
         cfg.update(kwargs)
 
         os.makedirs(self.output_dir, exist_ok=True)
         logger.info("Starting fine-tuning on: %s", data_yaml)
-        logger.info("Epochs: %d  (freeze=%d)", cfg["epochs"], cfg["freeze_epochs"])
+        logger.info("Epochs: %d  |  all layers unfrozen", cfg["epochs"])
 
-        # ── Phase 1: frozen backbone ──────────────────────────────────────
-        if cfg["freeze_epochs"] > 0:
-            logger.info("Phase 1: backbone frozen for %d epochs ...",
-                        cfg["freeze_epochs"])
-            self.model.train(
-                data          = data_yaml,
-                epochs        = cfg["freeze_epochs"],
-                imgsz         = cfg["img_size"],
-                batch         = cfg["batch_size"],
-                workers       = cfg["num_workers"],
-                optimizer     = cfg["optimizer"],
-                lr0           = cfg["lr0"],
-                lrf           = cfg["lrf"],
-                momentum      = cfg["momentum"],
-                weight_decay  = cfg["weight_decay"],
-                warmup_epochs = cfg["warmup_epochs"],
-                freeze        = cfg["freeze_layers"],
-                mosaic        = cfg["mosaic"],
-                mixup         = cfg["mixup"],
-                copy_paste    = cfg["copy_paste"],
-                hsv_h         = cfg["hsv_h"],
-                hsv_s         = cfg["hsv_s"],
-                hsv_v         = cfg["hsv_v"],
-                fliplr        = cfg["fliplr"],
-                flipud        = cfg["flipud"],
-                scale         = cfg["scale"],
-                translate     = cfg["translate"],
-                project       = self.output_dir,
-                name          = "phase1",
-                save_period   = cfg["save_period"],
-                exist_ok      = True,
-                verbose       = True,
-            )
-            # Reload best phase-1 checkpoint before phase 2
-            phase1_best = (
-                Path(self.output_dir) / "phase1" / "weights" / "best.pt"
-            )
-            if phase1_best.exists():
-                self.model = _YOLO(str(phase1_best))
-                self.model.to(self.device)
-                logger.info("Phase 1 done — loaded %s", phase1_best)
-
-        # ── Phase 2: full fine-tuning ─────────────────────────────────────
-        remaining = cfg["epochs"] - cfg["freeze_epochs"]
-        logger.info("Phase 2: full fine-tuning for %d epochs ...", remaining)
-
+        # ── Single stage: full fine-tuning — no freezing ──────────────────
         self.model.train(
             data          = data_yaml,
-            epochs        = remaining,
+            epochs        = cfg["epochs"],
             imgsz         = cfg["img_size"],
             batch         = cfg["batch_size"],
             workers       = cfg["num_workers"],
@@ -201,8 +147,8 @@ class YOLOv12ProposalGenerator:
             lrf           = cfg["lrf"],
             momentum      = cfg["momentum"],
             weight_decay  = cfg["weight_decay"],
-            warmup_epochs = 0,              # no warmup — resuming from phase 1
-            freeze        = 0,              # unfreeze all layers
+            warmup_epochs = cfg["warmup_epochs"],
+            freeze        = 0,              # no layers frozen
             mosaic        = cfg["mosaic"],
             mixup         = cfg["mixup"],
             copy_paste    = cfg["copy_paste"],
@@ -214,21 +160,22 @@ class YOLOv12ProposalGenerator:
             scale         = cfg["scale"],
             translate     = cfg["translate"],
             project       = self.output_dir,
-            name          = "phase2",
+            name          = "finetune",
             patience      = cfg["patience"],
             save_period   = cfg["save_period"],
             exist_ok      = True,
             verbose       = True,
         )
 
-        # Switch the active model to fine-tuned weights
-        best_pt = Path(self.output_dir) / "phase2" / "weights" / "best.pt"
+        # Switch to best weights automatically
+        best_pt = Path(self.output_dir) / "finetune" / "weights" / "best.pt"
         if best_pt.exists():
             self.load_weights(str(best_pt))
             logger.info("Fine-tuning complete — now using %s", best_pt)
         else:
-            logger.warning("best.pt not found at %s — keeping current weights",
-                           best_pt)
+            logger.warning(
+                "best.pt not found at %s — keeping current weights", best_pt
+            )
 
         return str(best_pt)
 
@@ -238,16 +185,13 @@ class YOLOv12ProposalGenerator:
         """
         Load a different set of weights into the model.
 
-        Use this to swap between COCO weights and fine-tuned weights,
-        or to load a checkpoint from a previous fine-tuning run.
-
         Args:
             weights_path : path to a .pt weights file
         """
         self.model = _YOLO(weights_path)
         self.model.to(self.device)
         self._weights_path = weights_path
-        self._finetuned    = "phase2" in weights_path or "best" in weights_path
+        self._finetuned    = "finetune" in weights_path or "best" in weights_path
         logger.info("Loaded weights: %s", weights_path)
 
     @property
@@ -287,9 +231,6 @@ class YOLOv12ProposalGenerator:
         """
         Run YOLOv12 on a single image and return filtered proposals.
 
-        Uses fine-tuned weights if available (after calling finetune()),
-        otherwise falls back to the weights loaded at construction time.
-
         Args:
             image_path : path to the X-ray image file
 
@@ -312,9 +253,9 @@ class YOLOv12ProposalGenerator:
         for result in results:
             if result.boxes is None or len(result.boxes) == 0:
                 continue
-            boxes  = result.boxes.xyxy.cpu().tolist()        # [x1, y1, x2, y2]
-            scores = result.boxes.conf.cpu().tolist()        # confidence scores
-            labels = result.boxes.cls.cpu().int().tolist()   # class indices
+            boxes  = result.boxes.xyxy.cpu().tolist()
+            scores = result.boxes.conf.cpu().tolist()
+            labels = result.boxes.cls.cpu().int().tolist()
 
             for bbox, score, label in zip(boxes, scores, labels):
                 proposals.append({
@@ -323,7 +264,6 @@ class YOLOv12ProposalGenerator:
                     "label": label,
                 })
 
-        # Sort highest confidence first, then cap
         proposals.sort(key=lambda p: p["score"], reverse=True)
         return proposals[: self.max_proposals]
 

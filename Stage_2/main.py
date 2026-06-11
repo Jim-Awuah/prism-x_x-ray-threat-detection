@@ -1,6 +1,4 @@
-# main.py — PRISM-X entry point
-#
-# Stages:
+#Stages:
 #   prepare  — convert OPIXray to YOLO format
 #   finetune — fine-tune YOLOv12 on OPIXray
 #   1        — BYOL self-supervised pre-training on SIXray/CLCXray
@@ -59,59 +57,71 @@ def parse_args():
 def run_prepare(args):
     if not args.opixray_src:
         raise ValueError("--opixray_src is required for --stage prepare")
+    # prepare_opixray.py lives in data/
     from finetune.data.prepare_opixray import prepare
     prepare(args.opixray_src, args.opixray_dst)
 
 
 def run_finetune(args) -> str:
-    from configs.finetune_config import FINETUNE_CONFIG
-    from stages.finetune_yolov12 import finetune, evaluate
-    cfg = dict(FINETUNE_CONFIG)
-    cfg["data_yaml"]  = args.data_yaml
-    cfg["variant"]    = args.yolo_variant
-    cfg["weights"]    = f"yolov12{args.yolo_variant}.pt"
-    cfg["output_dir"] = args.finetune_dir
-    if args.finetune_epochs:
-        cfg["epochs"] = args.finetune_epochs
-    best_pt = finetune(cfg)
+    from Stage_2.yolov12 import YOLOv12ProposalGenerator
+
+    gen = YOLOv12ProposalGenerator(
+        weights_path = f"yolov12{args.yolo_variant}.pt",
+        output_dir   = args.finetune_dir,
+    )
+    best_pt = gen.finetune(
+        data_yaml = args.data_yaml,
+        epochs    = args.finetune_epochs,   # None uses _DEFAULT_FT value
+    )
     if args.eval:
-        evaluate(best_pt, args.data_yaml, cfg["img_size"])
+        gen.evaluate(args.data_yaml)
     return best_pt
 
 
 def run_stage1(args, num_classes):
     if not args.data_root:
         raise ValueError("--data_root is required for stage 1")
-    from configs.byol_config import BYOL_CONFIG
+
     from data.datasets import SIXrayDataset, CLCXrayDataset
-    from stages.stage1_byol import train_byol
-    DatasetCls = SIXrayDataset if args.dataset == "sixray" else CLCXrayDataset
-    cfg = dict(BYOL_CONFIG)
-    cfg["num_classes"]         = num_classes
-    cfg["backbone_variant"]    = args.backbone
-    cfg["backbone_pretrained"] = not args.no_pretrain
-    cfg["resume"]              = not args.no_resume
-    if args.epochs:     cfg["epochs"]     = args.epochs
-    if args.batch_size: cfg["batch_size"] = args.batch_size
-    labeled_ds   = DatasetCls(root=args.data_root, labeled_only=True,  img_size=224)
-    unlabeled_ds = DatasetCls(root=args.data_root, labeled_only=False, img_size=224)
+    from Stage_1.byol import train_byol
+
+    # BYOL hyperparameters
+    cfg = {
+        "num_classes":         num_classes,
+        "backbone_variant":    args.backbone,
+        "backbone_pretrained": not args.no_pretrain,
+        "resume":              not args.no_resume,
+        "epochs":              args.epochs      or 50,
+        "batch_size":          args.batch_size  or 32,
+        "num_workers":         4,
+        "lr":                  1e-4,
+        "lr_min":              1e-6,
+        "weight_decay":        1e-4,
+        "grad_clip":           1.0,
+        "ema_decay":           0.996,
+        "img_size":            224,
+    }
+
+    DatasetCls   = SIXrayDataset if args.dataset == "sixray" else CLCXrayDataset
+    labeled_ds   = DatasetCls(root=args.data_root, labeled_only=True,  img_size=cfg["img_size"])
+    unlabeled_ds = DatasetCls(root=args.data_root, labeled_only=False, img_size=cfg["img_size"])
+
     logger.info("Labeled: %d  |  Unlabeled: %d", len(labeled_ds), len(unlabeled_ds))
     train_byol(labeled_ds, unlabeled_ds, cfg, output_dir=args.stage1_dir)
-
 
 def run_stage2(args, num_classes):
     if not args.data_root:
         raise ValueError("--data_root is required for stage 2")
-    from configs.stage2_config import STAGE2_CONFIG
+    from Stage_2.stage2_config import STAGE2_CONFIG
     from data.datasets import SIXrayDataset, CLCXrayDataset
-    from stages.stage2_pseudo_labels import run_stage2 as _run
+    from Stage_2.pseudo_labeler import run_stage2 as _run
     DatasetCls = SIXrayDataset if args.dataset == "sixray" else CLCXrayDataset
     cfg = dict(STAGE2_CONFIG)
     cfg["num_classes"]      = num_classes
     cfg["backbone_variant"] = args.backbone
     cfg["yolo_weights"]     = (
         args.yolo_weights
-        or f"{args.finetune_dir}/phase2/weights/best.pt"
+        or f"{args.finetune_dir}/finetune/weights/best.pt"
     )
     labeled_ds   = DatasetCls(root=args.data_root, labeled_only=True,  img_size=224)
     unlabeled_ds = DatasetCls(root=args.data_root, labeled_only=False, img_size=224)
