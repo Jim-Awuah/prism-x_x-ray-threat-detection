@@ -28,7 +28,7 @@ class VisionEncoder(nn.Module):
 
     backbone: image (B,3,H,W) → avgpool → (B, feat_dim)
     head:     (B, feat_dim)   → Linear  → (B, num_classes)
-    softmax:  (B, num_classes) → F
+    softmax:  (B, num_classes) → probability distribution F_S or F_T
     """
 
     def __init__(

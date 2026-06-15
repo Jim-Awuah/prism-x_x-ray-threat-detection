@@ -2,13 +2,17 @@
 torch>=2.0.0
 
 # torchvision — image transforms, dataset utilities
-# Used by: data/augmentations.py, models/byol.py (SwinV2 fallback backbone)
+# Used by: data/augmentations.py, byol.py and yolov12.py
 torchvision>=0.15.0
 
 # Ultralytics — provides YOLOv12 pretrained weights and training/inference API
-# Used by: models/yolov12_proposal.py, stages/finetune_yolov12.py
+# Used by: yolov12_proposal.py
 ultralytics>=8.0.0
 
 # Pillow — reading image dimensions in prepare_opixray.py
 # Used by: data/prepare_opixray.py
 Pillow>=9.0.0
+
+# BERT text encoder (Stage 3)
+# Used by: vision_language_detector.py
+transformers==5.7.0
