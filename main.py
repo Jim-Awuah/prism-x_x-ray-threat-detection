@@ -123,7 +123,7 @@ def run_prepare(args):
 def run_finetune(args) -> str:
     from Stage_2.yolov12 import YOLOv12ProposalGenerator
     gen = YOLOv12ProposalGenerator(
-        weights_path = f"yolov12{args.yolo_variant}.pt",
+        weights_path  = f"yolo12{args.yolo_variant}.pt",
         output_dir   = args.finetune_dir,
     )
     best_pt = gen.finetune(
