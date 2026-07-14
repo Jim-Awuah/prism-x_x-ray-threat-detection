@@ -1,7 +1,3 @@
-# BYOL – PRISM-X Stage 1  (Ahmed et al., IPM 2026, §4.2, Eq. 1, Fig. 3)
-#
-# Backbone: torchvision Swin Transformer V2 (Liu et al., 2022) — paper §5.1
-#
 # Two encoder branches on two augmented views of the same image:
 #
 #   v1 → Online encoder f_θ → Predictor q_θ → z1 ──┐
@@ -14,7 +10,7 @@
 # where ξ (target/momentum params) is updated as an EMA of θ (online params),
 # and gradients are NOT propagated through the target network.
 #
-# Algorithm 1, lines 2-7:
+# Algorithm:
 #   v1, v2  ← augment(x)
 #   z1 ← q_θ(f_θ(v1)),  z2 ← p_ξ(f_ξ(v2))
 #   L_BYOL ← ||z1 - z2||²
@@ -164,11 +160,6 @@ class BYOL(nn.Module):
 
         # feat_dim exposed for Stage 2 (PseudoLabelGenerator) and Stage 3
         self.feat_dim = feat_dim
-
-        # ── Backward-compatibility alias ─────────────────────────────────────
-        # Older Stage 2/3 code may refer to `byol.student` for the encoder.
-        # `student` now points at the online encoder directly so
-        # `extract_features()` and any legacy `.student.*` access still works.
         self.student = self.online_encoder
 
     # ── EMA update (Algorithm 1, line 7: ξ ← τ·ξ + (1−τ)·θ) ───────────────────

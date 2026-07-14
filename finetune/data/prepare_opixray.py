@@ -1,5 +1,3 @@
-# data/prepare_opixray.py
-#
 # Converts OPIXray dataset to YOLO format for ultralytics fine-tuning.
 #
 # Handles this folder structure:
@@ -24,11 +22,7 @@
 #       train/
 #       val/
 #     opixray.yaml
-#
-# Usage:
-#   python data/prepare_opixray.py \
-#       --src "/path/to/OPI Xray" \
-#       --dst opixray_yolo
+
 
 import argparse
 import shutil
