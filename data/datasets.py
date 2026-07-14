@@ -49,7 +49,7 @@ from torch.utils.data import Dataset
 from data.augmentations import StandardBYOLTransform, ThreatAwareTransform
 
 
-# ── SIXray ────────────────────────────────────────────────────────────────────
+#  SIXray 
 
 class SIXrayDataset(Dataset):
     """
@@ -111,7 +111,7 @@ class SIXrayDataset(Dataset):
         # Load samples from the CSV
         self.samples = self._load_from_csv(subset, split)
 
-    # ── Folder scanning ───────────────────────────────────────────────────────
+    #  Folder scanning 
 
     def _scan_image_folders(self) -> dict[str, Path]:
         """
@@ -128,7 +128,7 @@ class SIXrayDataset(Dataset):
                     stem_to_path[img_path.stem] = img_path
         return stem_to_path
 
-    # ── CSV loading ───────────────────────────────────────────────────────────
+    #  CSV loading 
 
     def _load_from_csv(self, subset: str, split: str) -> list[dict]:
         """
@@ -215,7 +215,7 @@ class SIXrayDataset(Dataset):
 
         return samples
 
-    # ── XML parsing ───────────────────────────────────────────────────────────
+    #  XML parsing 
 
     def _parse_xml(self, xml_path: Path, csv_labels: list[int]) -> list[dict]:
         """
@@ -263,7 +263,7 @@ class SIXrayDataset(Dataset):
 
         return annotations
 
-    # ── Dataset interface ─────────────────────────────────────────────────────
+    #  Dataset interface 
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -292,7 +292,7 @@ class SIXrayDataset(Dataset):
         }
 
 
-# ── CLCXray ───────────────────────────────────────────────────────────────────
+# CLCXray 
 
 class CLCXrayDataset(Dataset):
     """
