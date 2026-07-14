@@ -68,7 +68,7 @@ class YOLOv12ProposalGenerator:
 
     def __init__(
         self,
-        weights_path: str = "yolov12n.pt",
+        weights_path: str = "yolo12n.pt",
         conf_threshold: float = 0.65,
         iou_threshold: float = 0.45,
         img_size: int = 640,
