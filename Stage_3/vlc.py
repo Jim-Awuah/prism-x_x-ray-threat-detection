@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import torch
@@ -115,8 +113,13 @@ class DetectionLoss(nn.Module):
         inter   = inter_w * inter_h
 
         # Union
-        area_pred   = (pred[:, 2]   - pred[:, 0]) * (pred[:, 3]   - pred[:, 1])
-        area_target = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+        # clamp(min=0) is a defensive backstop: area should never be negative
+        # if boxes are valid (x2>x1, y2>y1), but this guards against any
+        # degenerate/inverted box slipping through so GIoU can't explode
+        # into a huge, meaningless value (e.g. giou=-32) if that guarantee
+        # is ever violated upstream.
+        area_pred   = (pred[:, 2]   - pred[:, 0]).clamp(min=0) * (pred[:, 3]   - pred[:, 1]).clamp(min=0)
+        area_target = (target[:, 2] - target[:, 0]).clamp(min=0) * (target[:, 3] - target[:, 1]).clamp(min=0)
         union = area_pred + area_target - inter + 1e-6
 
         iou = inter / union

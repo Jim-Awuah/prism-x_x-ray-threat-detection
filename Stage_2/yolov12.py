@@ -99,7 +99,7 @@ class YOLOv12ProposalGenerator:
         self.model.to(self.device)
         logger.info("Loaded weights: %s  (device=%s)", weights_path, self.device)
 
-    # ── Fine-tuning ───────────────────────────────────────────────────────────
+    # Fine-tuning
 
     def finetune(
         self,
@@ -135,7 +135,7 @@ class YOLOv12ProposalGenerator:
         logger.info("Starting fine-tuning on: %s", data_yaml)
         logger.info("Epochs: %d  |  all layers unfrozen", cfg["epochs"])
 
-        # ── Single stage: full fine-tuning — no freezing ──────────────────
+        # Single stage: full fine-tuning — no freezing 
         self.model.train(
             data          = data_yaml,
             epochs        = cfg["epochs"],
@@ -179,7 +179,7 @@ class YOLOv12ProposalGenerator:
 
         return str(best_pt)
 
-    # ── Weight management ─────────────────────────────────────────────────────
+    # Weight management
 
     def load_weights(self, weights_path: str) -> None:
         """
@@ -199,8 +199,7 @@ class YOLOv12ProposalGenerator:
         """True if the model is currently running fine-tuned weights."""
         return self._finetuned
 
-    # ── Evaluation ────────────────────────────────────────────────────────────
-
+    #  Evaluation 
     def evaluate(self, data_yaml: str) -> dict:
         """
         Run validation and return mAP metrics.
@@ -225,8 +224,7 @@ class YOLOv12ProposalGenerator:
                     results["precision"], results["recall"])
         return results
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-
+    # Inference
     def propose(self, image_path: str) -> list[dict]:
         """
         Run YOLOv12 on a single image and return filtered proposals.
@@ -279,8 +277,7 @@ class YOLOv12ProposalGenerator:
         """
         return [self.propose(p) for p in image_paths]
 
-    # ── String representation ─────────────────────────────────────────────────
-
+    # ── String representation 
     def __repr__(self) -> str:
         return (
             f"YOLOv12ProposalGenerator(\n"

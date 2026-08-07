@@ -310,6 +310,14 @@ class DetectionHead(nn.Module):
     Branch 1 (class head) : fusion_dim → num_classes + 1  (includes background)
     Branch 2 (box  head)  : fusion_dim → 4  (normalised [x1,y1,x2,y2])
 
+    Internally the box branch predicts (cx, cy, w, h) — each passed through
+    a sigmoid so all four lie in [0,1] — and is converted to [x1,y1,x2,y2]
+    before being returned. This guarantees x2 > x1 and y2 > y1 by
+    construction (since w, h >= 0), which a raw 4-way independent sigmoid
+    over [x1,y1,x2,y2] does NOT guarantee — that earlier parameterisation
+    allowed degenerate/inverted boxes (x2 < x1) that blow up GIoU into
+    huge, meaningless values (including large negative "losses").
+
     Args:
         fusion_dim  : input dimension
         num_classes : number of threat categories (background added internally)
@@ -329,12 +337,31 @@ class DetectionHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, num_classes + 1),    # +1 for background
         )
+        # Predicts (cx, cy, w, h), each in [0,1] via sigmoid. Converted to
+        # [x1,y1,x2,y2] in forward() so x2>x1 and y2>y1 hold by construction.
         self.box_head = nn.Sequential(
             nn.Linear(fusion_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 4),
             nn.Sigmoid(),                               # normalise to [0,1]
         )
+
+    @staticmethod
+    def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+        """
+        Convert (cx, cy, w, h) ∈ [0,1] to (x1, y1, x2, y2).
+
+        Because cx, cy, w, h all come from a sigmoid (so w, h >= 0), the
+        resulting x2 >= x1 and y2 >= y1 always hold — no degenerate boxes.
+        Final clamp to [0,1] guards against boxes that spill slightly
+        outside the image when a box is centred near an edge.
+        """
+        cx, cy, w, h = boxes.unbind(-1)
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        return torch.stack([x1, y1, x2, y2], dim=-1).clamp(0.0, 1.0)
 
     def forward(
         self, queries: torch.Tensor
@@ -345,9 +372,12 @@ class DetectionHead(nn.Module):
 
         Returns:
             class_logits : (B, Q, num_classes + 1)
-            boxes        : (B, Q, 4)  normalised [x1,y1,x2,y2]
+            boxes        : (B, Q, 4)  normalised [x1,y1,x2,y2], guaranteed
+                           valid (x2 > x1, y2 > y1)
         """
-        return self.class_head(queries), self.box_head(queries)
+        cxcywh = self.box_head(queries)               # (B, Q, 4) in [0,1]
+        boxes  = self._cxcywh_to_xyxy(cxcywh)          # (B, Q, 4) valid xyxy
+        return self.class_head(queries), boxes
 
 
 # ── 6. VisionLanguageDetector (full Stage 3 model) ───────────────────────────

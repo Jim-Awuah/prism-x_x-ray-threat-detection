@@ -39,6 +39,16 @@ STAGE3_CONFIG = {
     # ── Pseudo-label refresh cadence ─────────────────────────────────────
     "pseudo_refresh_every": 10,           # re-generate every N epochs (paper §4.3)
 
+    # ── Labeled-sample budget ────────────────────────────────────────────
+    # Paper §5.1: "For all semi-supervised experiments, we use a fixed set
+    # of 1000 labeled samples to ensure consistent and fair comparison
+    # across baselines." Used by data/prepare_labeled_annotations.py to
+    # subsample (with a fixed seed, for reproducibility) down to this many
+    # labeled images. Set to 0 (or pass --num_labeled 0 on the CLI) to use
+    # ALL available labeled samples instead of the paper's protocol.
+    "num_labeled_samples": 1000,
+    "labeled_sample_seed": 42,
+
     # Loss weights 
     "loss_weight_cls":   1.0,             # classification CE
     "loss_weight_bbox":  5.0,             # L1 box regression

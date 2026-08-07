@@ -11,14 +11,14 @@
 #   Step 1:  python main.py --stage finetune --data_yaml opixray_yolo/opixray.yaml
 #   Step 2:  python main.py --stage 1 \ --dataset sixray \ --data_root "/path/to/SIXray" \ --stage1_dir outputs/sixray/stage1
 #   Step 3:  python main.py --stage 2 \ --dataset sixray \ --data_root "/path/to/SIXray" \ --stage1_dir outputs/sixray/stage1 \ --stage2_dir outputs/sixray/stage2
-#   Step 4:  python main.py --stage 3 \ --dataset sixray \ --data_root "/path/to/SIXray" \ --stage1_dir outputs/sixray/stage1 \ --stage2_dir outputs/sixray/stage2 \ --stage3_dir outputs/sixray/stage3
+#   Step 4:  python main.py --stage 3 \ --dataset sixray \ --data_root "/Users/dersunscheinyn/SIXray_dataset/OpenDataLab___SIXray/raw/SIXray" \ --stage1_dir outputs/sixray/stage1 \ --stage2_dir outputs/sixray/stage2 \ --stage3_dir outputs/sixray/stage3
 #   All:     python main.py --stage all \
 #    --opixray_src "/path/to/OPI Xray" \
 #    --data_root   "/path/to/SIXray" \
 #    --stage1_dir  outputs/sixray/stage1 \
 #    --stage2_dir  outputs/sixray/stage2 \
 #    --stage3_dir  outputs/sixray/stage3
-
+#
 import argparse
 import logging
 import os
@@ -30,6 +30,22 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+# Stage 3 defaults are sourced from Stage_3/stage3_config.py so the CLI and
+# the documented config can never drift apart again (this is what caused
+# --stage3_batch_size to silently default to 8 instead of the paper's 32).
+# Falls back to paper-matching hardcoded values only if the config module
+# can't be imported (e.g. running main.py outside the project root).
+try:
+    from Stage_3.stage3_config import STAGE3_CONFIG
+except Exception as _cfg_err:
+    STAGE3_CONFIG = {}
+    logging.getLogger(__name__).warning(
+        "Could not import Stage_3.stage3_config (%s) — falling back to "
+        "hardcoded CLI defaults for Stage 3. Run main.py from the project "
+        "root so config values stay the single source of truth.", _cfg_err
+    )
+
  
 # Text prompts use "An X-ray of a <class>" — best format per Table 8 (paper §6.2.7)
 DATASETS = {
@@ -63,7 +79,7 @@ DATASETS = {
 }
  
  
-# ── Argument parser ───────────────────────────────────────────────────────────
+# Argument parser 
  
 def parse_args():
     p = argparse.ArgumentParser(description="PRISM-X pipeline")
@@ -102,20 +118,21 @@ def parse_args():
  
     # Stage 3
     p.add_argument("--stage3_dir",           default="outputs/stage3")
-    p.add_argument("--stage3_epochs",        type=int,   default=50)
-    p.add_argument("--stage3_batch_size",    type=int,   default=8)
-    p.add_argument("--stage3_lr",            type=float, default=1e-4)
+    p.add_argument("--stage3_epochs",        type=int,   default=STAGE3_CONFIG.get("epochs", 50))
+    p.add_argument("--stage3_batch_size",    type=int,   default=STAGE3_CONFIG.get("batch_size", 32),
+                   help="Paper §5.1 uses batch_size=32. Previously defaulted to 8 here — "
+                        "now sourced from stage3_config.py so it can't silently drift again.")
+    p.add_argument("--stage3_lr",            type=float, default=STAGE3_CONFIG.get("lr", 1e-4))
     p.add_argument("--labeled_annotations",  default=None)
-    p.add_argument("--fusion_dim",           type=int,   default=256)
-    p.add_argument("--num_decoder_layers",   type=int,   default=3)
-    p.add_argument("--pseudo_label_refresh", type=int,   default=10)
+    p.add_argument("--fusion_dim",           type=int,   default=STAGE3_CONFIG.get("fusion_dim", 256))
+    p.add_argument("--num_decoder_layers",   type=int,   default=STAGE3_CONFIG.get("num_decoder_layers", 3))
+    p.add_argument("--pseudo_label_refresh", type=int,   default=STAGE3_CONFIG.get("pseudo_refresh_every", 10))
  
     p.add_argument("--eval", action="store_true")
     return p.parse_args()
  
  
-# ── Helper: build datasets ────────────────────────────────────────────────────
- 
+# Helper: build datasets 
 def _build_datasets(args, labeled_only_flag=None):
     """Build labeled and unlabeled datasets matching your folder structure."""
     from data.datasets import SIXrayDataset, CLCXrayDataset
@@ -132,7 +149,7 @@ def _build_datasets(args, labeled_only_flag=None):
     return labeled_ds, unlabeled_ds
  
  
-# ── Stage runners ─────────────────────────────────────────────────────────────
+# Stage runners 
  
 def run_prepare(args):
     if not args.opixray_src:
@@ -170,7 +187,12 @@ def run_stage1(args, num_classes):
     from pathlib import Path
  
     os.makedirs(args.stage1_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = (
+    "mps" if torch.backends.mps.is_available()
+    else "cuda" if torch.cuda.is_available()
+    else "cpu"
+    )
+    print(f"Using device: {device}")
     logger.info("Stage 1 — BYOL pre-training on %s", device)
  
     labeled_ds, unlabeled_ds = _build_datasets(args)
@@ -181,7 +203,7 @@ def run_stage1(args, num_classes):
         batch_size  = args.batch_size or 32,
         shuffle     = True,
         num_workers = 4,
-        pin_memory  = True,
+        pin_memory  = torch.cuda.is_available(),
         drop_last   = True,
     )
  
@@ -201,10 +223,19 @@ def run_stage1(args, num_classes):
     epochs    = args.epochs or 50
     optimizer = optim.AdamW(model.trainable_parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
- 
-    # Mixed-precision training (paper §5.1)
-    use_amp = torch.cuda.is_available()
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # Mixed-precision training (paper §5.1). Only well-supported on CUDA —
+    # MPS's autocast op coverage is still incomplete/experimental in
+    # mainstream PyTorch, so on MPS/CPU we intentionally train in full FP32
+    # rather than risk silent numerical issues from partial autocast support.
+    use_amp = (device == "cuda")
+    scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
+    logger.info(
+        "Precision: %s  (paper uses mixed-precision on CUDA; %s)",
+        "mixed (fp16 autocast)" if use_amp else "full fp32",
+        "matches paper" if use_amp else
+        f"device is '{device}', not CUDA — falling back to fp32 as the stable option",
+    )
  
     best_loss = float("inf")
     for epoch in range(start_epoch, epochs):
@@ -216,7 +247,7 @@ def run_stage1(args, num_classes):
             v2 = batch["v2"].to(device, non_blocking=True)
             optimizer.zero_grad()
  
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 loss, _, _ = model(v1, v2)
  
             scaler.scale(loss).backward()
@@ -252,7 +283,12 @@ def run_stage2(args, num_classes):
     from utils.checkpoint import load_checkpoint
  
     os.makedirs(args.stage2_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = (
+    "mps" if torch.backends.mps.is_available()
+    else "cuda" if torch.cuda.is_available()
+    else "cpu"
+    )
+    print(f"Using device: {device}")
     logger.info("Stage 2 — Pseudo-label generation  (device: %s)", device)
  
     # Load BYOL from Stage 1 checkpoint
@@ -271,13 +307,15 @@ def run_stage2(args, num_classes):
  
     # Load YOLOv12
     cfg          = dict(STAGE2_CONFIG)
-    yolo_weights = (
-        args.yolo_weights
-        or f"{args.finetune_dir}/finetune/weights/best.pt"
+    YOLO_WEIGHTS_PATH = (
+        "/Users/dersunscheinyn/Desktop/prism-x_x-ray-threat-detection"
+        "/runs/detect/outputs/finetune/finetune/weights/best.pt"
     )
+    yolo_weights = args.yolo_weights or YOLO_WEIGHTS_PATH
     if not Path(yolo_weights).exists():
-        logger.warning("YOLOv12 weights not found — falling back to yolov12n.pt")
-        yolo_weights = "yolov12n.pt"
+        logger.warning("YOLOv12 weights not found at %s — falling back to yolo12n.pt",
+                       yolo_weights)
+        yolo_weights = "yolo12n.pt"
  
     proposal_gen = YOLOv12ProposalGenerator(
         weights_path   = yolo_weights,
@@ -331,7 +369,12 @@ def run_stage3(args, num_classes, class_names):
     from Stage_3.stage3_dataset import Stage3Dataset, stage3_collate_fn
  
     os.makedirs(args.stage3_dir, exist_ok=True)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = (
+    "mps" if torch.backends.mps.is_available()
+    else "cuda" if torch.cuda.is_available()
+    else "cpu"
+    )
+    print(f"Using device: {device}")
     logger.info("Stage 3 — Vision-Language Detection  (device: %s)", device)
  
     pseudo_label_file = str(Path(args.stage2_dir) / "pseudo_labels.json")
@@ -359,10 +402,33 @@ def run_stage3(args, num_classes, class_names):
         )
         return DataLoader(ds, batch_size=args.stage3_batch_size,
                           shuffle=True, num_workers=4,
-                          collate_fn=stage3_collate_fn, pin_memory=True)
+                          collate_fn=stage3_collate_fn, pin_memory=torch.cuda.is_available())
  
     loader = _build_loader()
     logger.info("Stage 3 dataset: %d samples", len(loader.dataset))
+
+    # Report how many labeled samples are actually feeding training, and
+    # whether that matches the paper's fixed-1000-sample protocol (§5.1).
+    # This is informational only — it does not change what was already
+    # written by prepare_labeled_annotations.py — but makes any resulting
+    # numbers self-documenting rather than silently non-comparable.
+    if args.labeled_annotations and Path(args.labeled_annotations).exists():
+        try:
+            import json as _json
+            with open(args.labeled_annotations) as _f:
+                _n_labeled = len(_json.load(_f))
+            _paper_n = STAGE3_CONFIG.get("num_labeled_samples", 1000)
+            logger.info(
+                "Labeled samples: %d  (paper §5.1 protocol: %d fixed labeled "
+                "samples; %s)",
+                _n_labeled, _paper_n,
+                "matches paper" if _n_labeled == _paper_n else
+                "DIFFERS from paper — re-run prepare_labeled_annotations.py "
+                f"with --num_labeled {_paper_n} to match, or note the "
+                "deviation when comparing results",
+            )
+        except Exception:
+            pass  # purely informational logging; never block training on it
  
     model = VisionLanguageDetector(
         num_classes        = num_classes,
@@ -380,9 +446,23 @@ def run_stage3(args, num_classes, class_names):
         optimizer, T_max=args.stage3_epochs, eta_min=1e-6
     )
  
-    # Mixed-precision training (paper §5.1)
-    use_amp = torch.cuda.is_available()
-    scaler  = torch.cuda.amp.GradScaler(enabled=use_amp)
+    # Mixed-precision training (paper §5.1). Only well-supported on CUDA —
+    # MPS's autocast op coverage is still incomplete/experimental in
+    # mainstream PyTorch, so on MPS/CPU we intentionally train in full FP32
+    # rather than risk silent numerical issues from partial autocast support.
+    use_amp = (device == "cuda")
+    scaler  = torch.amp.GradScaler("cuda", enabled=use_amp)
+    logger.info(
+        "Precision: %s  (paper uses mixed-precision on CUDA; %s)",
+        "mixed (fp16 autocast)" if use_amp else "full fp32",
+        "matches paper" if use_amp else
+        f"device is '{device}', not CUDA — falling back to fp32 as the stable option",
+    )
+    logger.info(
+        "Stage 3 batch_size=%d  (paper §5.1 uses 32; source: %s)",
+        args.stage3_batch_size,
+        "STAGE3_CONFIG" if "batch_size" in STAGE3_CONFIG else "hardcoded fallback",
+    )
  
     best_loss = float("inf")
     for epoch in range(args.stage3_epochs):
@@ -409,7 +489,7 @@ def run_stage3(args, num_classes, class_names):
             B, K, C, h, w = region_imgs.shape
             optimizer.zero_grad()
  
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 out = model(
                     images          = images,
                     bbox_proposals  = bbox_coords,
@@ -454,10 +534,236 @@ def run_stage3(args, num_classes, class_names):
             logger.info("  → saved best checkpoint (loss=%.4f)", avg_loss)
  
     logger.info("Stage 3 complete. Best loss: %.4f", best_loss)
+
+    # ── Final evaluation (paper §5.1 — mAP, AP50, AP75, Grounding Accuracy) ──
+    #
+    # IMPORTANT: mAP/AP50/AP75 and Grounding Accuracy are DELIBERATELY two
+    # separate computations that must never be merged into one:
+    #
+    #   - mAP/AP50/AP75 : standard COCO-style detection metrics. ALL real
+    #     (non-padded) proposals per image are treated as candidate
+    #     detections, ranked by confidence, and matched against ALL GT
+    #     boxes for that image via torchmetrics' MeanAveragePrecision
+    #     (which wraps pycocotools under the hood). This rewards a model
+    #     that ranks correct detections above false positives.
+    #
+    #   - Grounding Accuracy : a per-OBJECT recall metric. For each
+    #     individual ground-truth box, we ask "does *any* real proposal
+    #     predict the correct class with IoU >= 0.5 against THIS box?" —
+    #     independent of confidence ranking or how many false positives
+    #     the model also produced elsewhere in the image.
+    #
+    #   These measure different things and WILL differ numerically (see
+    #   the reference paper: AP50=87.4% vs Grounding Acc=48.3% — a ~39pt
+    #   gap). If a future edit makes these two come out identical again,
+    #   that is a strong signal the two computations have been accidentally
+    #   collapsed into one — check for a shared top-1-only prediction loop
+    #   before trusting the numbers.
+    logger.info("Running final evaluation on best checkpoint ...")
+
+    # Load best checkpoint
+    best_ckpt = str(Path(args.stage3_dir) / "best.pth")
+    if Path(best_ckpt).exists():
+        ckpt = torch.load(best_ckpt, map_location=device)
+        model.load_state_dict(ckpt["state_dict"])
+        logger.info("Loaded best checkpoint from epoch %d", ckpt["epoch"])
+    model.eval()
+
+    # Build test dataset using labeled annotations only
+    if args.labeled_annotations and Path(args.labeled_annotations).exists():
+        from Stage_3.stage3_dataset import Stage3Dataset, stage3_collate_fn
+        eval_ds = Stage3Dataset(
+            pseudo_label_file   = pseudo_label_file,
+            labeled_annotations = args.labeled_annotations,
+            img_size            = 224,
+            crop_size           = 224,
+            max_proposals       = 100,
+            return_crops        = True,
+        )
+        eval_loader = torch.utils.data.DataLoader(
+            eval_ds,
+            batch_size  = args.stage3_batch_size,
+            shuffle     = False,
+            num_workers = 4,
+            collate_fn  = stage3_collate_fn,
+            pin_memory  = torch.cuda.is_available(),
+        )
+
+        # Verify the metrics library is available BEFORE running the (slow)
+        # evaluation loop, so a missing dependency fails fast with a clear,
+        # actionable message instead of a cryptic error after minutes of
+        # inference, or — worse — silently skipping the report entirely.
+        try:
+            from torchmetrics.detection.mean_ap import MeanAveragePrecision
+        except ModuleNotFoundError as e:
+            logger.error(
+                "Evaluation requires 'torchmetrics' and 'pycocotools' for "
+                "correct COCO-style mAP computation, but they are not "
+                "installed (%s).\n"
+                "Install them with:\n"
+                "    pip install torchmetrics pycocotools\n"
+                "Evaluation was skipped — no eval_results.json was written.",
+                str(e),
+            )
+            return
+
+        from torchvision.ops import box_iou
+
+        # ── Metric accumulators ──────────────────────────────────────────
+        # Per-image dicts consumed by torchmetrics' MeanAveragePrecision.
+        map_preds:   list[dict] = []
+        map_targets: list[dict] = []
+
+        # Per-object counters for grounding accuracy (see note above).
+        grounding_correct = 0
+        grounding_total   = 0
+
+        with torch.no_grad():
+            for batch in eval_loader:
+                images        = batch["images"].to(device)
+                region_imgs   = batch["region_imgs"].to(device)
+                bbox_coords   = batch["bbox_coords"].to(device)
+                pseudo_labels = batch["pseudo_labels"].to(device)
+                gt_boxes      = batch["gt_boxes"]
+                gt_labels     = batch["gt_labels"]
+                valid_mask    = batch["valid_mask"]
+
+                B, K, C, h, w = region_imgs.shape
+
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    out = model(
+                        images         = images,
+                        bbox_proposals = bbox_coords,
+                        pseudo_labels  = pseudo_labels,
+                        region_images  = region_imgs.view(B * K, C, h, w),
+                    )
+
+                pred_logits     = out["class_logits"].cpu()   # (B, Q, C+1)
+                pred_boxes      = out["pred_boxes"].cpu()     # (B, Q, 4)
+                bbox_coords_cpu = bbox_coords.cpu()
+
+                probs  = torch.softmax(pred_logits, dim=-1)[..., :-1]  # exclude background
+                scores, labels = probs.max(dim=-1)                     # (B, Q)
+
+                for b in range(B):
+                    gt_mask = valid_mask[b]                    # (K,) bool — real GT slots
+                    if gt_mask.sum() == 0:
+                        continue                                # nothing to evaluate against
+                    gidx     = gt_mask.nonzero(as_tuple=True)[0]
+                    g_boxes  = gt_boxes[b][gidx]                # (M, 4)
+                    g_labels = gt_labels[b][gidx]               # (M,)
+
+                    # Real (non-padded) proposals only. stage3_collate_fn
+                    # pads every field with zeros, so a padded slot is an
+                    # exact [0,0,0,0] box (area == 0) — this reliably tells
+                    # real Stage-2 proposals apart from batch padding
+                    # without needing an extra field in the dataset.
+                    props     = bbox_coords_cpu[b]
+                    prop_area = (props[:, 2] - props[:, 0]) * (props[:, 3] - props[:, 1])
+                    prop_mask = prop_area > 0
+
+                    if prop_mask.sum() == 0:
+                        # No real proposals at all for this image: contribute
+                        # an empty prediction set (every GT box is a miss).
+                        map_preds.append({
+                            "boxes":  torch.zeros((0, 4)),
+                            "scores": torch.zeros((0,)),
+                            "labels": torch.zeros((0,), dtype=torch.long),
+                        })
+                        map_targets.append({"boxes": g_boxes, "labels": g_labels})
+                        grounding_total += g_boxes.shape[0]
+                        continue
+
+                    p_boxes  = pred_boxes[b][prop_mask]         # (P, 4)
+                    p_scores = scores[b][prop_mask]             # (P,)
+                    p_labels = labels[b][prop_mask]             # (P,)
+
+                    map_preds.append({
+                        "boxes":  p_boxes,
+                        "scores": p_scores,
+                        "labels": p_labels,
+                    })
+                    map_targets.append({"boxes": g_boxes, "labels": g_labels})
+
+                    # ── Grounding accuracy: per-GT-object recall @ IoU 0.5 ──
+                    # For each GT box, look only at same-class proposals and
+                    # take the best IoU among them. This is independent of
+                    # confidence ranking and independent of how many other
+                    # (possibly wrong) predictions exist elsewhere in the
+                    # image — unlike mAP/AP50 above.
+                    iou         = box_iou(g_boxes, p_boxes)              # (M, P)
+                    same_class  = g_labels.unsqueeze(1) == p_labels.unsqueeze(0)  # (M, P)
+                    iou_matched = iou.masked_fill(~same_class, 0.0)
+                    best_iou, _ = iou_matched.max(dim=1)                 # (M,)
+                    grounding_correct += int((best_iou >= 0.5).sum().item())
+                    grounding_total   += g_boxes.shape[0]
+
+        # ── Compute & report metrics ───────────────────────────────────────
+        try:
+            if len(map_preds) == 0:
+                raise RuntimeError(
+                    "No images with valid ground truth were found during "
+                    "evaluation. Check that --labeled_annotations points to "
+                    "a non-empty file and that Stage3Dataset is actually "
+                    "mixing labeled samples into the eval set."
+                )
+
+            map_metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox")
+            map_metric.update(map_preds, map_targets)
+            map_result = map_metric.compute()
+
+            # torchmetrics returns -1 for an undefined metric (e.g. a class
+            # with no predictions at all in the whole eval set) — clamp so
+            # we never report a nonsensical negative percentage.
+            mAP  = max(float(map_result["map"]),    0.0)
+            AP50 = max(float(map_result["map_50"]), 0.0)
+            AP75 = max(float(map_result["map_75"]), 0.0)
+
+            grounding = grounding_correct / max(grounding_total, 1)
+
+            logger.info("=" * 60)
+            logger.info("FINAL EVALUATION RESULTS")
+            logger.info("=" * 60)
+            logger.info("  mAP (0.5:0.95) : %.4f  (%.1f%%)", mAP,  mAP  * 100)
+            logger.info("  AP50           : %.4f  (%.1f%%)", AP50, AP50 * 100)
+            logger.info("  AP75           : %.4f  (%.1f%%)", AP75, AP75 * 100)
+            logger.info("  Grounding Acc  : %.4f  (%.1f%%)  [%d/%d objects]",
+                         grounding, grounding * 100, grounding_correct, grounding_total)
+            logger.info("=" * 60)
+
+            # Save results to file
+            import json as _json
+            results = {
+                "mAP":           round(mAP   * 100, 2),
+                "AP50":          round(AP50  * 100, 2),
+                "AP75":          round(AP75  * 100, 2),
+                "grounding_acc": round(grounding * 100, 2),
+                "grounding_correct": grounding_correct,
+                "grounding_total":   grounding_total,
+                "epoch":         ckpt.get("epoch", 0) if Path(best_ckpt).exists() else 0,
+            }
+            results_path = str(Path(args.stage3_dir) / "eval_results.json")
+            with open(results_path, "w") as f:
+                _json.dump(results, f, indent=2)
+            logger.info("Results saved to %s", results_path)
+
+        except Exception:
+            # Log the FULL traceback rather than swallowing it into a one-
+            # line warning — a silently-skipped, misleading eval report is
+            # worse than a loud failure here.
+            logger.exception(
+                "Evaluation failed with an unexpected error — see traceback "
+                "above. No eval_results.json was written."
+            )
+
+    else:
+        logger.warning(
+            "No labeled_annotations provided — skipping final evaluation.\n"
+            "Re-run with --labeled_annotations outputs/sixray/labeled_annotations.json"
+        )
  
  
-# ── Entry point ───────────────────────────────────────────────────────────────
- 
+# Entry point
 def main():
     args        = parse_args()
     meta        = DATASETS[args.dataset]
@@ -486,4 +792,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 
