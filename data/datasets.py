@@ -423,3 +423,240 @@ class CLCXrayDataset(Dataset):
             "is_labeled": sample["is_labeled"],
             "img_path":  str(sample["img_path"]),
         }
+
+# EDS 
+
+class EDSDataset(Dataset):
+    """
+    EDS (Endoscopy/X-ray Domain Shift) dataset — plain-text annotations,
+    split across three acquisition domains.
+
+    Folder structure:
+        root/
+          domain1/
+            images/          ← .jpg files
+            txt/             ← one .txt per image, same stem
+          domain2/
+            images/
+            txt/
+          domain3/
+            images/
+            txt/
+
+    Annotation format — one object per line, multiple lines per file:
+
+        00001.jpg knife         231 194 402 431
+        00001.jpg lighter       371 438 475 511
+        00001.jpg lighter       386 454 490 524
+        00001.jpg device        245 100 491 202
+        00001.jpg plasticbottle 264 231 556 405
+
+    i.e.  <image_name> <class_name> <xmin> <ymin> <xmax> <ymax>
+
+    Boxes are kept in absolute pixel [x1, y1, x2, y2] form — the SAME
+    convention SIXrayDataset and CLCXrayDataset return, and the form
+    Stage3Dataset._convert_labeled() expects before it normalises. Do NOT
+    convert to YOLO cxcywh here.
+
+    Unlike SIXray (which has a train/test CSV split) and CLCXray (which
+    has train/val/test folders), EDS ships as three *domains*, not splits.
+    Domains are acquisition conditions, not train/test partitions, so this
+    class takes `domain` rather than `split`. If you need a held-out set,
+    hold out a whole domain (the standard domain-generalisation protocol
+    for this dataset) via --domain, or split indices downstream.
+
+    Args:
+        root         : EDS_Dataset root directory
+        domain       : "domain1" | "domain2" | "domain3" | "all"
+        labeled_only : if True, only return images that have >=1 parseable box
+        img_size     : spatial size for transforms
+        augment      : optional custom transform override
+    """
+
+    # MUST stay index-for-index identical to DATASETS["eds"]["class_names"]
+    # in main.py, and to EDS_CLASS_NAMES in
+    # data/prepare_labeled_annotations.py. If you add or reorder a class in
+    # one place, change all three — otherwise boxes silently train against
+    # the wrong text prompt and nothing errors.
+    CLASS_NAMES = [
+        "device",         # 0
+        "glassbottle",    # 1
+        "knife",          # 2
+        "laptop",         # 3
+        "lighter",        # 4
+        "plasticbottle",  # 5
+        "powerbank",      # 6
+        "pressure",       # 7
+        "scissor",        # 8
+        "umbrella",       # 9
+    ]
+    CLASS_TO_IDX = {c: i for i, c in enumerate(CLASS_NAMES)}
+
+    DOMAINS = ["domain1", "domain2", "domain3"]
+
+    def __init__(
+        self,
+        root: str,
+        domain: str = "all",
+        labeled_only: bool = False,
+        img_size: int = 224,
+        augment: Optional[Callable] = None,
+    ) -> None:
+        self.root         = Path(root)
+        self.labeled_only = labeled_only
+
+        self.threat_transform   = ThreatAwareTransform(img_size=img_size)
+        self.standard_transform = StandardBYOLTransform(img_size=img_size)
+        if augment is not None:
+            self.threat_transform   = augment
+            self.standard_transform = augment
+
+        if domain == "all":
+            domains = self.DOMAINS
+        elif domain in self.DOMAINS:
+            domains = [domain]
+        else:
+            raise ValueError(
+                f"domain must be one of {self.DOMAINS} or 'all', got {domain!r}"
+            )
+        self.domains = domains
+
+        # One flat sample list across domains rather than a ConcatDataset.
+        # ConcatDataset would hide .samples / .CLASS_NAMES behind a wrapper,
+        # and Stage 1/2 code reaches for those attributes directly — a flat
+        # list keeps EDSDataset a drop-in for SIXrayDataset/CLCXrayDataset.
+        self.samples: list[dict] = []
+        for d in domains:
+            self.samples.extend(self._load_domain(d))
+
+    #  Annotation parsing 
+
+    def _parse_txt(self, txt_path: Path) -> list[dict]:
+        """
+        Parse one EDS annotation file into a list of box dicts.
+
+        Every line is an independent object, so a single file yields
+        multiple boxes and may span multiple classes. Malformed lines and
+        unknown class names are skipped individually rather than
+        discarding the whole file.
+        """
+        if not txt_path.exists():
+            return []
+
+        annotations = []
+        try:
+            with open(txt_path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return []
+
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 6:
+                continue                      # blank or truncated line
+
+            # parts[0] is the image name, which we already know from the
+            # filename — it is not re-checked, since some EDS copies have
+            # a stale name in-file after images were renamed.
+            cls_name = parts[1].strip().lower()
+            if cls_name not in self.CLASS_TO_IDX:
+                continue                      # class outside the 10 canonical ones
+
+            try:
+                x1 = float(parts[2])
+                y1 = float(parts[3])
+                x2 = float(parts[4])
+                y2 = float(parts[5])
+            except ValueError:
+                continue                      # non-numeric coordinates
+
+            # Guard against inverted boxes in the raw annotations. A box
+            # with x2 < x1 produces a negative area and blows up IoU/GIoU
+            # downstream, so normalise the ordering here at the source.
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if y2 < y1:
+                y1, y2 = y2, y1
+            if x2 <= x1 or y2 <= y1:
+                continue                      # zero-area box, unusable
+
+            annotations.append({
+                "class":     cls_name,
+                "class_idx": self.CLASS_TO_IDX[cls_name],
+                "bbox":      [x1, y1, x2, y2],
+            })
+
+        return annotations
+
+    #  Domain loading 
+
+    def _load_domain(self, domain: str) -> list[dict]:
+        """
+        Build the sample list for one domain.
+
+        Annotations are matched to images by *stem* (00001.jpg <-> 00001.txt).
+        Matching by sorted-glob position instead would silently mis-pair
+        every image whose annotation file is missing.
+        """
+        dom_dir = self.root / domain
+        img_dir = dom_dir / "images"
+        txt_dir = dom_dir / "txt"
+
+        if not img_dir.is_dir():
+            raise FileNotFoundError(
+                f"EDS image directory not found:\n  {img_dir}\n"
+                f"Expected layout: {self.root}/<domain>/images and /txt"
+            )
+
+        samples = []
+        for ext in ("*.jpg", "*.jpeg", "*.png"):
+            for img_path in sorted(img_dir.glob(ext)):
+                annotations = self._parse_txt(txt_dir / (img_path.stem + ".txt"))
+                is_labeled  = len(annotations) > 0
+
+                if self.labeled_only and not is_labeled:
+                    continue
+
+                samples.append({
+                    "img_path":    img_path,
+                    "stem":        img_path.stem,
+                    "domain":      domain,
+                    "annotations": annotations,
+                    "is_labeled":  is_labeled,
+                })
+
+        return samples
+
+    #  Dataset interface 
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict:
+        sample = self.samples[idx]
+        img    = Image.open(sample["img_path"]).convert("RGB")
+
+        # Mirrors SIXrayDataset/CLCXrayDataset exactly: BYOL consumes the
+        # two views, and the first annotation supplies the crop hint plus
+        # the single label/bbox the Stage 1/2 heads expect. The full
+        # multi-object annotation list is preserved in self.samples and is
+        # what data/prepare_labeled_annotations.py reads for Stage 3, so no
+        # boxes are lost — Stage 3 gets every object.
+        if sample["is_labeled"] and sample["annotations"]:
+            ann    = sample["annotations"][0]
+            v1, v2 = self.threat_transform(img, bbox=ann["bbox"])
+            label  = ann["class_idx"]
+            bbox   = torch.tensor(ann["bbox"], dtype=torch.float32)
+        else:
+            v1, v2 = self.standard_transform(img)
+            label  = -1
+            bbox   = torch.zeros(4)
+
+        return {
+            "v1":        v1,
+            "v2":        v2,
+            "label":     torch.tensor(label, dtype=torch.long),
+            "bbox":      bbox,
+            "is_labeled": sample["is_labeled"],
+            "img_path":  str(sample["img_path"]),
+        }

@@ -76,6 +76,25 @@ DATASETS = {
             "An X-ray of a tin",
         ],
     },
+    # Order MUST match EDSDataset.CLASS_NAMES in data/datasets.py and
+    # EDS_CLASS_NAMES in data/prepare_labeled_annotations.py index-for-index:
+    #   0 device        1 glassbottle   2 knife     3 laptop    4 lighter
+    #   5 plasticbottle 6 powerbank     7 pressure  8 scissor   9 umbrella
+    "eds": {
+        "num_classes": 10,
+        "class_names": [
+            "An X-ray of a device",
+            "An X-ray of a glass bottle",
+            "An X-ray of a knife",
+            "An X-ray of a laptop",
+            "An X-ray of a lighter",
+            "An X-ray of a plastic bottle",
+            "An X-ray of a powerbank",
+            "An X-ray of a pressure",
+            "An X-ray of a scissor",
+            "An X-ray of an umbrella",
+        ],
+    },
 }
  
  
@@ -90,7 +109,14 @@ def parse_args():
     p.add_argument("--data_root", default=None)
     p.add_argument("--subset",    default="SIXray10",
                    choices=["SIXray10", "SIXray100", "SIXray1000", "all"],
-                   help="SIXray subset to use (ignored for CLCXray)")
+                   help="SIXray subset to use (ignored for CLCXray and EDS)")
+    p.add_argument("--domain",    default="all",
+                   choices=["domain1", "domain2", "domain3", "all"],
+                   help="EDS acquisition domain (ignored for SIXray and "
+                        "CLCXray). EDS ships as three domains rather than "
+                        "train/test splits — use a single domain to train "
+                        "under the domain-generalisation protocol, or 'all' "
+                        "to pool every domain.")
     p.add_argument("--backbone",  default="swin_v2_t",
                    choices=["swin_v2_t", "swin_v2_s", "swin_v2_b"])
  
@@ -124,9 +150,34 @@ def parse_args():
                         "now sourced from stage3_config.py so it can't silently drift again.")
     p.add_argument("--stage3_lr",            type=float, default=STAGE3_CONFIG.get("lr", 1e-4))
     p.add_argument("--labeled_annotations",  default=None)
+    p.add_argument("--eval_labeled_annotations", default=None,
+                   help="Labeled annotations to EVALUATE on, when different "
+                        "from the training set. This is what the EDS "
+                        "cross-domain protocol (paper Table 4) needs: train "
+                        "on a source domain, evaluate on a different target "
+                        "domain. Defaults to --labeled_annotations "
+                        "(in-domain evaluation, as used for SIXray/CLCXray "
+                        "in Tables 2 and 3).")
+    p.add_argument("--eval_pseudo_labels", default=None,
+                   help="pseudo_labels.json for the EVAL domain. Region "
+                        "proposals must come from the images being "
+                        "evaluated, so cross-domain eval needs Stage 2 run "
+                        "on the target domain too. Defaults to the training "
+                        "domain's <stage2_dir>/pseudo_labels.json.")
     p.add_argument("--fusion_dim",           type=int,   default=STAGE3_CONFIG.get("fusion_dim", 256))
     p.add_argument("--num_decoder_layers",   type=int,   default=STAGE3_CONFIG.get("num_decoder_layers", 3))
-    p.add_argument("--pseudo_label_refresh", type=int,   default=STAGE3_CONFIG.get("pseudo_refresh_every", 10))
+    p.add_argument("--pseudo_label_refresh", type=int,   default=STAGE3_CONFIG.get("pseudo_refresh_every", 10),
+                   help="Regenerate pseudo-labels every N epochs (paper: 10). "
+                        "On MPS each refresh takes hours (full Stage 2 re-run "
+                        "on 74k images). Use 25 or 50 to reduce frequency, "
+                        "or --no_pseudo_refresh to disable entirely.")
+    p.add_argument("--no_pseudo_refresh", action="store_true", default=False,
+                   help="Disable mid-training pseudo-label regeneration. "
+                        "Fastest option for MPS: use the Stage 2 labels "
+                        "generated before training and never re-run Stage 2. "
+                        "Slightly reduces final accuracy vs the paper's "
+                        "every-10-epoch refresh, but avoids multi-hour "
+                        "Stage 2 re-runs on MPS mid-training.")
  
     p.add_argument("--eval", action="store_true")
     return p.parse_args()
@@ -136,16 +187,36 @@ def parse_args():
 def _build_datasets(args, labeled_only_flag=None):
     """Build labeled and unlabeled datasets matching your folder structure."""
     from data.datasets import SIXrayDataset, CLCXrayDataset
- 
+
     if args.dataset == "sixray":
         labeled_ds   = SIXrayDataset(root=args.data_root, subset=args.subset,
                                      labeled_only=True,  img_size=224)
         unlabeled_ds = SIXrayDataset(root=args.data_root, subset=args.subset,
                                      labeled_only=False, img_size=224)
-    else:
+    elif args.dataset == "clcxray":
         labeled_ds   = CLCXrayDataset(root=args.data_root, labeled_only=True,  img_size=224)
         unlabeled_ds = CLCXrayDataset(root=args.data_root, labeled_only=False, img_size=224)
- 
+    elif args.dataset == "eds":
+        try:
+            from data.datasets import EDSDataset
+        except ImportError:
+            raise ImportError(
+                "EDSDataset not found in data/datasets.py. "
+                "Copy the updated datasets.py file:\n"
+                "  cp ~/Downloads/datasets.py data/datasets.py"
+            )
+        labeled_ds   = EDSDataset(root=args.data_root, domain=args.domain,
+                                  labeled_only=True,  img_size=224)
+        unlabeled_ds = EDSDataset(root=args.data_root, domain=args.domain,
+                                  labeled_only=False, img_size=224)
+        logger.info("EDS domain(s): %s  -  %d labeled / %d total images",
+                    args.domain, len(labeled_ds), len(unlabeled_ds))
+    else:
+        raise ValueError(
+            f"Unknown dataset {args.dataset!r}. Known datasets: "
+            f"{list(DATASETS)}"
+        )
+
     return labeled_ds, unlabeled_ds
  
  
@@ -400,9 +471,15 @@ def run_stage3(args, num_classes, class_names):
             max_proposals       = 100,
             return_crops        = True,
         )
+        # num_workers=0 on MPS: multiple worker processes cause allocator
+        # contention on Apple Silicon and trigger MallocStackLogging spam.
+        # On CUDA, 4 workers are fine.
+        nw = 0 if (device == "mps") else 4
         return DataLoader(ds, batch_size=args.stage3_batch_size,
-                          shuffle=True, num_workers=4,
-                          collate_fn=stage3_collate_fn, pin_memory=torch.cuda.is_available())
+                          shuffle=True, num_workers=nw,
+                          collate_fn=stage3_collate_fn,
+                          pin_memory=torch.cuda.is_available(),
+                          persistent_workers=False)
  
     loader = _build_loader()
     logger.info("Stage 3 dataset: %d samples", len(loader.dataset))
@@ -468,8 +545,18 @@ def run_stage3(args, num_classes, class_names):
     for epoch in range(args.stage3_epochs):
  
         # Regenerate pseudo-labels every N epochs (paper §4.3)
-        if epoch > 0 and epoch % args.pseudo_label_refresh == 0:
-            logger.info("Epoch %d — regenerating pseudo-labels ...", epoch + 1)
+        do_refresh = (
+            not getattr(args, "no_pseudo_refresh", False)
+            and epoch > 0
+            and args.pseudo_label_refresh > 0
+            and epoch % args.pseudo_label_refresh == 0
+        )
+        if do_refresh:
+            logger.info(
+                "Epoch %d — regenerating pseudo-labels "
+                "(suppress with --no_pseudo_refresh, or increase interval "
+                "with --pseudo_label_refresh N) ...", epoch + 1
+            )
             run_stage2(args, num_classes)
             loader = _build_loader()
  
@@ -513,14 +600,25 @@ def run_stage3(args, num_classes, class_names):
             scaler.update()
             epoch_loss += losses["total"].item()
             n_batches  += 1
+            # Cache scalar values immediately so no tensor/graph reference
+            # survives past this batch step. On MPS, holding graph refs
+            # across batches accumulates memory and causes the progressive
+            # slowdown (each epoch takes longer than the last).
+            last_loss = {k: v.item() for k, v in losses.items()}
  
         scheduler.step()
         avg_loss = epoch_loss / max(n_batches, 1)
+        # Flush MPS allocator cache. Without this, the MPS memory allocator
+        # accumulates fragmented buffers across epochs — allocation gets
+        # progressively slower (visible as each epoch taking longer than
+        # the last). This is the MPS equivalent of torch.cuda.empty_cache().
+        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+            torch.mps.empty_cache()
         logger.info(
             "Epoch [%d/%d]  loss=%.4f  cls=%.4f  bbox=%.4f  giou=%.4f  vlc=%.4f",
             epoch + 1, args.stage3_epochs, avg_loss,
-            losses["cls"].item(), losses["bbox"].item(),
-            losses["giou"].item(), losses["vlc"].item(),
+            last_loss.get("cls", 0.0), last_loss.get("bbox", 0.0),
+            last_loss.get("giou", 0.0), last_loss.get("vlc", 0.0),
         )
  
         if avg_loss < best_loss:
@@ -569,12 +667,38 @@ def run_stage3(args, num_classes, class_names):
         logger.info("Loaded best checkpoint from epoch %d", ckpt["epoch"])
     model.eval()
 
-    # Build test dataset using labeled annotations only
-    if args.labeled_annotations and Path(args.labeled_annotations).exists():
+    # Build test dataset using labeled annotations only.
+    #
+    # For SIXray/CLCXray (paper Tables 2, 3) evaluation is in-domain, so
+    # eval_ann falls back to the training annotations. For the EDS
+    # cross-domain benchmark (paper Table 4) the model trains on a source
+    # domain and is evaluated on a DIFFERENT target domain, which is what
+    # --eval_labeled_annotations / --eval_pseudo_labels are for. Note that
+    # Table 4 reports grounding accuracy only — mAP/AP50/AP75 are not
+    # reported for EDS in the paper.
+    eval_ann    = args.eval_labeled_annotations or args.labeled_annotations
+    eval_pseudo = args.eval_pseudo_labels or pseudo_label_file
+
+    if eval_ann and Path(eval_ann).exists():
+        if args.eval_labeled_annotations:
+            logger.info(
+                "CROSS-DOMAIN evaluation: trained on %s, evaluating on %s",
+                args.labeled_annotations, eval_ann,
+            )
+            if not args.eval_pseudo_labels:
+                logger.warning(
+                    "--eval_labeled_annotations was set but "
+                    "--eval_pseudo_labels was not. Region proposals will "
+                    "come from the TRAINING domain's pseudo_labels.json, "
+                    "which does not contain the target domain's images — "
+                    "most eval images will have no proposals and the "
+                    "reported numbers will be wrong. Run Stage 2 on the "
+                    "target domain and pass its pseudo_labels.json."
+                )
         from Stage_3.stage3_dataset import Stage3Dataset, stage3_collate_fn
         eval_ds = Stage3Dataset(
-            pseudo_label_file   = pseudo_label_file,
-            labeled_annotations = args.labeled_annotations,
+            pseudo_label_file   = eval_pseudo,
+            labeled_annotations = eval_ann,
             img_size            = 224,
             crop_size           = 224,
             max_proposals       = 100,
