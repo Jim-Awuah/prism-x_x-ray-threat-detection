@@ -101,10 +101,21 @@ def parse_xml(xml_path: Path) -> list[dict]:
 def collect_sixray_samples(data_root: str, subset: str, split: str) -> list[dict]:
     root     = Path(data_root)
     ann_dir  = root / "Annotation"
-    csv_path = Path("/Users/dersunscheinyn/SIXray_dataset/OpenDataLab___SIXray/raw/SIXray/ImageSet/10/train.csv")
+    # CSV path is derived from data_root and subset so it works for
+    # SIXray10 (ImageSet/10/), SIXray100 (ImageSet/100/), and
+    # SIXray1000 (ImageSet/1000/) without hardcoding.
+    sdir     = SUBSET_MAP.get(subset, "10")
+    csv_path = Path(data_root) / "ImageSet" / sdir / f"{split}.csv"
+    if not csv_path.exists():
+        # Fallback: try the old hardcoded path for backwards compat
+        csv_path = Path(data_root) / "ImageSet" / "10" / f"{split}.csv"
 
     if not csv_path.exists():
-        raise FileNotFoundError(f"CSV not found: {csv_path}")
+        raise FileNotFoundError(
+            f"CSV not found: {csv_path}\n"
+            f"Expected at: {Path(data_root)/'ImageSet'/sdir/split}.csv\n"
+            f"Check that --subset {subset} matches your ImageSet folder structure."
+        )
 
     # Build stem → image path map
     skip = {"Annotation", "ImageSet", ".cache", ".DS_Store"}
@@ -259,12 +270,12 @@ def collect_eds_samples(data_root: str, domain: str) -> list[dict]:
     n_bad_class = 0
     n_bad_line  = 0
     for dom in domains:
-        img_dir = root / dom / "images"
+        img_dir = root / dom / "image"   # EDS uses "image" not "images"
         txt_dir = root / dom / "txt"
         if not img_dir.is_dir():
             raise FileNotFoundError(
                 f"EDS image directory not found:\n  {img_dir}\n"
-                f"Expected layout: {root}/<domain>/images and /txt"
+                f"Expected layout: {root}/<domain>/image and /txt"
             )
 
         for ext in ("*.jpg", "*.jpeg", "*.png"):
@@ -389,4 +400,3 @@ if __name__ == "__main__":
 
     prepare(args.dataset, args.data_root, args.subset, args.split, args.out,
             num_labeled=args.num_labeled, seed=args.seed, domain=args.domain)
-

@@ -71,20 +71,108 @@ class FrozenVisionEncoder(nn.Module):
         self.proj = nn.Linear(feat_dim, fusion_dim)
 
     def _load_stage1_weights(self, ckpt_path: str) -> None:
-        """Load SwinV2 weights from BYOL student checkpoint saved in Stage 1."""
-        ckpt   = torch.load(ckpt_path, map_location="cpu")
-        # Stage 1 saves the full BYOL model; extract student backbone weights
-        state  = ckpt.get("model_state_dict", ckpt)
-        prefix = "student."
-        backbone_state = {
-            k[len(prefix):]: v
-            for k, v in state.items()
-            if k.startswith(prefix) and not k.startswith(f"{prefix}head")
-        }
-        missing, unexpected = self.load_state_dict(backbone_state, strict=False)
-        if missing:
-            print(f"[FrozenVisionEncoder] Missing keys: {missing[:5]} ...")
-        print(f"[FrozenVisionEncoder] Loaded Stage 1 backbone from {ckpt_path}")
+        """
+        Load SwinV2 weights from the BYOL student checkpoint saved in Stage 1.
+
+        This used to assume exactly one container key ("model_state_dict")
+        and exactly one prefix ("student."). When either assumption was
+        wrong the dict comprehension produced {}, load_state_dict(strict=
+        False) accepted it without complaint, and the "frozen pretrained
+        encoder" silently stayed at ImageNet init — i.e. Stage 1 was
+        thrown away with only a truncated "Missing keys: [...] ..." line
+        to show for it. Per the paper's Fig. 7, self-supervised pretraining
+        is what produces threat/normal feature separation, so losing it
+        quietly costs a large amount of mAP while everything still "runs".
+
+        Now: try every common container key, auto-detect the prefix by
+        testing which one actually matches this module's own parameter
+        names, and raise if the match is too poor to be a real load.
+        """
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+
+        # 1. Unwrap the container. Different stages/scripts have used
+        #    different key names, so try them all rather than assume.
+        state = None
+        if isinstance(ckpt, dict):
+            for container_key in ("model_state_dict", "state_dict",
+                                  "model", "net", "weights"):
+                inner = ckpt.get(container_key)
+                if isinstance(inner, dict) and inner:
+                    # A real state dict maps str -> Tensor. The outer
+                    # checkpoint maps str -> (dict | int | float), so this
+                    # check stops us mistaking the wrapper for the payload.
+                    if all(isinstance(v, torch.Tensor) for v in list(inner.values())[:8]):
+                        state = inner
+                        break
+            if state is None:
+                # Maybe the checkpoint IS the state dict (no wrapper).
+                if ckpt and all(isinstance(v, torch.Tensor)
+                                for v in list(ckpt.values())[:8]):
+                    state = ckpt
+        if state is None:
+            raise RuntimeError(
+                f"Could not find a parameter state dict inside {ckpt_path}. "
+                f"Top-level keys: {list(ckpt)[:10] if isinstance(ckpt, dict) else type(ckpt)}"
+            )
+
+        target_keys = set(self.state_dict().keys())
+
+        # 2. Auto-detect the prefix. BYOL implementations wrap the encoder
+        #    under varying names; pick whichever strips to the most keys
+        #    this module actually has.
+        candidate_prefixes = [
+            "student.", "online_encoder.", "online.", "encoder.",
+            "backbone.", "student.backbone.", "online_encoder.backbone.",
+            "module.", "",
+        ]
+        # Also harvest prefixes empirically from the checkpoint itself, so
+        # a naming scheme not in the list above is still found.
+        for k in list(state)[:200]:
+            for anchor in ("features.", "norm.", "avgpool."):
+                pos = k.find(anchor)
+                if pos > 0:
+                    candidate_prefixes.append(k[:pos])
+
+        best_prefix, best_state, best_hits = None, {}, -1
+        for prefix in dict.fromkeys(candidate_prefixes):   # dedupe, keep order
+            stripped = {
+                k[len(prefix):]: v
+                for k, v in state.items()
+                if k.startswith(prefix) and not k[len(prefix):].startswith("head")
+            }
+            hits = len(target_keys & set(stripped))
+            if hits > best_hits:
+                best_prefix, best_state, best_hits = prefix, stripped, hits
+
+        # 3. Load, then verify the load was real rather than vacuous.
+        #    self.proj does not exist yet at this point (it is created after
+        #    this call), so it is not expected to be in the checkpoint.
+        missing, unexpected = self.load_state_dict(best_state, strict=False)
+        expected  = {k for k in target_keys if not k.startswith("proj.")}
+        loaded    = len(expected) - len([m for m in missing if not m.startswith("proj.")])
+        frac      = loaded / max(len(expected), 1)
+
+        if frac < 0.5:
+            raise RuntimeError(
+                f"Stage 1 checkpoint loaded almost nothing into the vision "
+                f"encoder: only {loaded}/{len(expected)} backbone tensors "
+                f"matched ({frac:.1%}).\n"
+                f"  checkpoint : {ckpt_path}\n"
+                f"  best prefix tried: {best_prefix!r}\n"
+                f"  example checkpoint keys : {list(state)[:5]}\n"
+                f"  example keys we need    : {sorted(expected)[:5]}\n"
+                f"Training would silently proceed on an ImageNet-init "
+                f"backbone and discard all of Stage 1, so this is raised "
+                f"instead. Fix the key naming (or pass the right file) and "
+                f"re-run."
+            )
+
+        print(f"[FrozenVisionEncoder] Loaded {loaded}/{len(expected)} backbone "
+              f"tensors ({frac:.1%}) from {ckpt_path} using prefix {best_prefix!r}")
+        if frac < 0.95:
+            print(f"[FrozenVisionEncoder] WARNING: {len(expected) - loaded} "
+                  f"backbone tensors did NOT load and remain at "
+                  f"initialisation — check the checkpoint is complete.")
 
     @torch.no_grad()
     def _extract(self, x: torch.Tensor) -> torch.Tensor:
@@ -310,14 +398,6 @@ class DetectionHead(nn.Module):
     Branch 1 (class head) : fusion_dim → num_classes + 1  (includes background)
     Branch 2 (box  head)  : fusion_dim → 4  (normalised [x1,y1,x2,y2])
 
-    Internally the box branch predicts (cx, cy, w, h) — each passed through
-    a sigmoid so all four lie in [0,1] — and is converted to [x1,y1,x2,y2]
-    before being returned. This guarantees x2 > x1 and y2 > y1 by
-    construction (since w, h >= 0), which a raw 4-way independent sigmoid
-    over [x1,y1,x2,y2] does NOT guarantee — that earlier parameterisation
-    allowed degenerate/inverted boxes (x2 < x1) that blow up GIoU into
-    huge, meaningless values (including large negative "losses").
-
     Args:
         fusion_dim  : input dimension
         num_classes : number of threat categories (background added internally)
@@ -337,31 +417,12 @@ class DetectionHead(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, num_classes + 1),    # +1 for background
         )
-        # Predicts (cx, cy, w, h), each in [0,1] via sigmoid. Converted to
-        # [x1,y1,x2,y2] in forward() so x2>x1 and y2>y1 hold by construction.
         self.box_head = nn.Sequential(
             nn.Linear(fusion_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 4),
             nn.Sigmoid(),                               # normalise to [0,1]
         )
-
-    @staticmethod
-    def _cxcywh_to_xyxy(boxes: torch.Tensor) -> torch.Tensor:
-        """
-        Convert (cx, cy, w, h) ∈ [0,1] to (x1, y1, x2, y2).
-
-        Because cx, cy, w, h all come from a sigmoid (so w, h >= 0), the
-        resulting x2 >= x1 and y2 >= y1 always hold — no degenerate boxes.
-        Final clamp to [0,1] guards against boxes that spill slightly
-        outside the image when a box is centred near an edge.
-        """
-        cx, cy, w, h = boxes.unbind(-1)
-        x1 = cx - w / 2
-        y1 = cy - h / 2
-        x2 = cx + w / 2
-        y2 = cy + h / 2
-        return torch.stack([x1, y1, x2, y2], dim=-1).clamp(0.0, 1.0)
 
     def forward(
         self, queries: torch.Tensor
@@ -372,12 +433,9 @@ class DetectionHead(nn.Module):
 
         Returns:
             class_logits : (B, Q, num_classes + 1)
-            boxes        : (B, Q, 4)  normalised [x1,y1,x2,y2], guaranteed
-                           valid (x2 > x1, y2 > y1)
+            boxes        : (B, Q, 4)  normalised [x1,y1,x2,y2]
         """
-        cxcywh = self.box_head(queries)               # (B, Q, 4) in [0,1]
-        boxes  = self._cxcywh_to_xyxy(cxcywh)          # (B, Q, 4) valid xyxy
-        return self.class_head(queries), boxes
+        return self.class_head(queries), self.box_head(queries)
 
 
 # ── 6. VisionLanguageDetector (full Stage 3 model) ───────────────────────────

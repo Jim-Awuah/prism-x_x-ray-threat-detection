@@ -599,13 +599,13 @@ class EDSDataset(Dataset):
         every image whose annotation file is missing.
         """
         dom_dir = self.root / domain
-        img_dir = dom_dir / "images"
+        img_dir = dom_dir / "image"   # EDS uses "image" not "images"
         txt_dir = dom_dir / "txt"
 
         if not img_dir.is_dir():
             raise FileNotFoundError(
                 f"EDS image directory not found:\n  {img_dir}\n"
-                f"Expected layout: {self.root}/<domain>/images and /txt"
+                f"Expected layout: {self.root}/<domain>/image and /txt"
             )
 
         samples = []

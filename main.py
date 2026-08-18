@@ -355,9 +355,9 @@ def run_stage2(args, num_classes):
  
     os.makedirs(args.stage2_dir, exist_ok=True)
     device = (
-    "mps" if torch.backends.mps.is_available()
-    else "cuda" if torch.cuda.is_available()
-    else "cpu"
+        "cuda" if torch.cuda.is_available()
+        else "mps"  if torch.backends.mps.is_available()
+        else "cpu"
     )
     print(f"Using device: {device}")
     logger.info("Stage 2 — Pseudo-label generation  (device: %s)", device)
@@ -552,12 +552,21 @@ def run_stage3(args, num_classes, class_names):
             and epoch % args.pseudo_label_refresh == 0
         )
         if do_refresh:
+            import time as _time
+            _t0 = _time.time()
             logger.info(
-                "Epoch %d — regenerating pseudo-labels "
-                "(suppress with --no_pseudo_refresh, or increase interval "
-                "with --pseudo_label_refresh N) ...", epoch + 1
+                "Epoch %d/%d — regenerating pseudo-labels "
+                "(next refresh at epoch %d; suppress with --no_pseudo_refresh) ...",
+                epoch + 1, args.stage3_epochs,
+                epoch + 1 + args.pseudo_label_refresh
             )
             run_stage2(args, num_classes)
+            _elapsed = (_time.time() - _t0) / 60
+            logger.info(
+                "Pseudo-label regeneration complete in %.1f min. "
+                "Resuming Stage 3 from epoch %d.",
+                _elapsed, epoch + 2
+            )
             loader = _build_loader()
  
         model.train()
