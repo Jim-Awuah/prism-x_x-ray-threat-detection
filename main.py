@@ -232,7 +232,7 @@ def run_prepare(args):
 def run_finetune(args) -> str:
     from Stage_2.yolov12 import YOLOv12ProposalGenerator
     gen = YOLOv12ProposalGenerator(
-        weights_path = f"yolov12{args.yolo_variant}.pt",
+        weights_path = f"yolo12{args.yolo_variant}.pt",
         output_dir   = args.finetune_dir,
     )
     best_pt = gen.finetune(
@@ -621,7 +621,10 @@ def run_stage3(args, num_classes, class_names):
         # accumulates fragmented buffers across epochs — allocation gets
         # progressively slower (visible as each epoch taking longer than
         # the last). This is the MPS equivalent of torch.cuda.empty_cache().
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        # Clear GPU cache — works on both CUDA (Kaggle) and MPS (Apple Silicon Mac)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
         logger.info(
             "Epoch [%d/%d]  loss=%.4f  cls=%.4f  bbox=%.4f  giou=%.4f  vlc=%.4f",
