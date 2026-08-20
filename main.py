@@ -378,15 +378,20 @@ def run_stage2(args, num_classes):
  
     # Load YOLOv12
     cfg          = dict(STAGE2_CONFIG)
-    YOLO_WEIGHTS_PATH = (
-        "/Users/dersunscheinyn/Desktop/prism-x_x-ray-threat-detection"
-        "/runs/detect/outputs/finetune/finetune/weights/best.pt"
+    # Resolve weights path — works on both Mac and Kaggle
+    # Priority: --yolo_weights arg > finetune_dir output > COCO fallback
+    yolo_weights = (
+        args.yolo_weights
+        or str(Path(args.finetune_dir) / "finetune" / "weights" / "best.pt")
     )
-    yolo_weights = args.yolo_weights or YOLO_WEIGHTS_PATH
     if not Path(yolo_weights).exists():
-        logger.warning("YOLOv12 weights not found at %s — falling back to yolo12n.pt",
-                       yolo_weights)
+        logger.warning(
+            "YOLOv12 weights not found at %s — falling back to yolo12n.pt",
+            yolo_weights
+        )
         yolo_weights = "yolo12n.pt"
+    else:
+        logger.info("YOLOv12 weights loaded from %s", yolo_weights)
  
     proposal_gen = YOLOv12ProposalGenerator(
         weights_path   = yolo_weights,
