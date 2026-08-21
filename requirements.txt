@@ -16,3 +16,13 @@ Pillow>=9.0.0
 # BERT text encoder (Stage 3)
 # Used by: vision_language_detector.py
 transformers==5.7.0
+
+ 
+# torchmetrics — MeanAveragePrecision (mAP, AP50, AP75) for Stage 3 evaluation
+# Used by: main.py run_stage3() evaluation block
+torchmetrics>=1.0.0
+
+# pycocotools — standard COCO mAP evaluator for fair comparison with paper
+# Used by: evaluation scripts in main.py
+# Note: on Windows install with: pip install pycocotools-windows
+pycocotools>=2.0.0

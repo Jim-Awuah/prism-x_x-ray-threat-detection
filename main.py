@@ -104,7 +104,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="PRISM-X pipeline")
  
     p.add_argument("--stage", default="all",
-                   choices=["prepare", "finetune", "1", "2", "3", "all"])
+                   choices=["prepare", "finetune", "1", "2", "3", "all", "eds"])
     p.add_argument("--dataset",   choices=list(DATASETS), default="sixray")
     p.add_argument("--data_root", default=None)
     p.add_argument("--subset",    default="SIXray10",
@@ -117,6 +117,9 @@ def parse_args():
                         "train/test splits — use a single domain to train "
                         "under the domain-generalisation protocol, or 'all' "
                         "to pool every domain.")
+    p.add_argument("--target_domain", default="D2",
+                   choices=["D1", "D2", "D3"],
+                   help="EDS target domain for cross-domain evaluation")
     p.add_argument("--backbone",  default="swin_v2_t",
                    choices=["swin_v2_t", "swin_v2_s", "swin_v2_b"])
  
@@ -904,6 +907,203 @@ def run_stage3(args, num_classes, class_names):
         )
  
  
+
+def run_eds_cross_domain(args, num_classes, class_names):
+    """
+    EDS cross-domain evaluation — paper Table 4.
+
+    Trains on source domain (--domain D1/D2/D3) and evaluates
+    grounding accuracy on target domain (--target_domain D1/D2/D3).
+
+    Runs the full pipeline on the source domain:
+        Stage 1 (BYOL) → Stage 2 (pseudo-labels) → Stage 3 (VLM)
+    Then evaluates on the target domain using the trained Stage 3 model.
+    """
+    import json
+    from pathlib import Path
+
+    src  = args.domain
+    tgt  = args.target_domain
+
+    if src == tgt:
+        raise ValueError(
+            f"--domain and --target_domain must be different. "
+            f"Both are set to {src}."
+        )
+
+    logger.info("EDS cross-domain: train on %s → evaluate on %s", src, tgt)
+
+    # Output directories per source domain
+    base            = Path(args.stage1_dir).parent
+    args.stage1_dir = str(base / f"eds_{src}" / "stage1")
+    args.stage2_dir = str(base / f"eds_{src}" / "stage2")
+    args.stage3_dir = str(base / f"eds_{src}" / "stage3")
+
+    # Step 1 — prepare source domain annotations
+    src_ann = str(base / f"eds_{src}" / f"labeled_annotations_{src}.json")
+    if not Path(src_ann).exists():
+        logger.info("Preparing source domain annotations (%s)...", src)
+        from data.prepare_eds_annotations import prepare
+        prepare(args.data_root, src, src_ann)
+    args.labeled_annotations = src_ann
+
+    # Step 2 — run full pipeline on source domain
+    run_stage1(args, num_classes)
+    run_stage2(args, num_classes)
+    run_stage3(args, num_classes, class_names)
+
+    # Step 3 — prepare target domain annotations for evaluation
+    tgt_ann = str(base / f"eds_{src}" / f"labeled_annotations_{tgt}.json")
+    if not Path(tgt_ann).exists():
+        logger.info("Preparing target domain annotations (%s)...", tgt)
+        from data.prepare_eds_annotations import prepare
+        prepare(args.data_root, tgt, tgt_ann)
+
+    # Step 4 — evaluate on target domain
+    logger.info("Evaluating on target domain %s ...", tgt)
+    _run_eds_eval(args, num_classes, class_names, tgt_ann, src, tgt)
+
+
+def _run_eds_eval(args, num_classes, class_names, tgt_ann, src, tgt):
+    """
+    Run cross-domain grounding accuracy evaluation.
+    Loads Stage 3 model trained on source domain,
+    evaluates on target domain annotations.
+    """
+    import json, torch
+    from pathlib import Path
+    from torch.utils.data import DataLoader
+    from Stage_3.vision_language_detector import VisionLanguageDetector
+    from Stage_3.stage3_dataset import Stage3Dataset, stage3_collate_fn
+
+    device    = "cuda" if torch.cuda.is_available() else "cpu"
+    best_ckpt = str(Path(args.stage3_dir) / "best.pth")
+
+    if not Path(best_ckpt).exists():
+        raise FileNotFoundError(
+            f"Stage 3 checkpoint not found: {best_ckpt}\n"
+            "Run --stage eds first to train on the source domain."
+        )
+
+    # Load model trained on source domain
+    ckpt = torch.load(best_ckpt, map_location=device)
+    model = VisionLanguageDetector(
+        num_classes        = num_classes,
+        backbone_variant   = args.backbone,
+        fusion_dim         = args.fusion_dim,
+        num_decoder_layers = args.num_decoder_layers,
+        stage1_ckpt        = str(Path(args.stage1_dir) / "best.pth"),
+        class_names        = class_names,
+    ).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+    logger.info("Loaded Stage 3 model from epoch %d", ckpt["epoch"])
+
+    # Build target domain dataset
+    pseudo_file = str(Path(args.stage2_dir) / "pseudo_labels.json")
+    dataset = Stage3Dataset(
+        pseudo_label_file   = pseudo_file,
+        labeled_annotations = tgt_ann,
+        img_size            = 224,
+        crop_size           = 224,
+        max_proposals       = 100,
+        return_crops        = True,
+    )
+    loader = DataLoader(
+        dataset, batch_size=args.stage3_batch_size,
+        shuffle=False, num_workers=4,
+        collate_fn=stage3_collate_fn,
+        pin_memory=torch.cuda.is_available(),
+    )
+    logger.info("Target domain dataset: %d samples", len(dataset))
+
+    # Compute grounding accuracy @0.5 IoU (paper Table 4 metric)
+    correct = 0
+    total   = 0
+    use_amp = torch.cuda.is_available()
+
+    with torch.no_grad():
+        for batch in loader:
+            images        = batch["images"].to(device)
+            region_imgs   = batch["region_imgs"].to(device)
+            bbox_coords   = batch["bbox_coords"].to(device)
+            pseudo_labels = batch["pseudo_labels"].to(device)
+            gt_boxes      = batch["gt_boxes"]
+            gt_labels     = batch["gt_labels"]
+            valid_mask    = batch["valid_mask"]
+
+            B, K, C, h, w = region_imgs.shape
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                out = model(
+                    images         = images,
+                    bbox_proposals = bbox_coords,
+                    pseudo_labels  = pseudo_labels,
+                    region_images  = region_imgs.view(B*K, C, h, w),
+                )
+
+            pred_logits = out["class_logits"].cpu()
+            pred_boxes  = out["pred_boxes"].cpu()
+            probs       = torch.softmax(pred_logits, dim=-1)[..., :-1]
+            scores, labels = probs.max(dim=-1)
+
+            for b in range(B):
+                mask = valid_mask[b]
+                if mask.sum() == 0:
+                    continue
+
+                # Top-1 prediction
+                top_score, top_idx = scores[b].max(dim=0)
+                pred_box   = pred_boxes[b][top_idx]
+                pred_label = labels[b][top_idx].item()
+
+                # First valid ground truth
+                gt_idx   = mask.nonzero(as_tuple=True)[0][0]
+                gt_box   = gt_boxes[b][gt_idx]
+                gt_label = gt_labels[b][gt_idx].item()
+
+                total += 1
+
+                # Grounding correct if class matches AND IoU >= 0.5
+                if pred_label == gt_label:
+                    pb = pred_box.tolist()
+                    gb = gt_box.tolist()
+                    ix1 = max(pb[0], gb[0]); iy1 = max(pb[1], gb[1])
+                    ix2 = min(pb[2], gb[2]); iy2 = min(pb[3], gb[3])
+                    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+                    area_p = max((pb[2]-pb[0])*(pb[3]-pb[1]), 1e-6)
+                    area_g = max((gb[2]-gb[0])*(gb[3]-gb[1]), 1e-6)
+                    union  = area_p + area_g - inter + 1e-6
+                    iou    = inter / union
+                    if iou >= 0.5:
+                        correct += 1
+
+    grounding_acc = correct / max(total, 1) * 100
+
+    logger.info("=" * 55)
+    logger.info("EDS CROSS-DOMAIN RESULTS  %s → %s", src, tgt)
+    logger.info("=" * 55)
+    logger.info("  Grounding Accuracy @0.5 IoU : %.2f%%", grounding_acc)
+    logger.info("  Correct / Total             : %d / %d", correct, total)
+    logger.info("  Paper (PRISM-X)             : 32.4%% - 35.0%%")
+    logger.info("=" * 55)
+
+    # Save results
+    results = {
+        "source_domain":  src,
+        "target_domain":  tgt,
+        "grounding_acc":  round(grounding_acc, 2),
+        "correct":        correct,
+        "total":          total,
+        "paper_range":    "32.4% - 35.0%",
+    }
+    out_path = str(Path(args.stage3_dir) / f"eds_{src}_to_{tgt}_results.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    logger.info("Results saved to %s", out_path)
+    return results
+
+
 # Entry point
 def main():
     args        = parse_args()
@@ -921,6 +1121,8 @@ def main():
         run_stage2(args, num_classes)
     elif args.stage == "3":
         run_stage3(args, num_classes, class_names)
+    elif args.stage == "eds":
+        run_eds_cross_domain(args, num_classes, class_names)
     elif args.stage == "all":
         if args.opixray_src:
             run_prepare(args)
